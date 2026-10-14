@@ -12,9 +12,7 @@ import (
 )
 
 // fencedChat is a Chat upstream that answers every request with the JSON
-// wrapped in a Markdown code fence, streamed in pieces that split the fence,
-// as gemini-3.8-flash did behind magpie when Codex asked for its memory
-// extraction in text.format.
+// wrapped in a Markdown code fence, streamed in pieces that split the fence.
 type fencedChat struct{ answer string }
 
 func (f fencedChat) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -107,6 +105,11 @@ func TestUnfence(t *testing.T) {
 		{"```json\n{\"a\":1}\n```", `{"a":1}`},
 		{"  ```\n[1,2]\n```  \n", `[1,2]`},
 		{"```JSON\r\n{\"a\":1}\r\n```", `{"a":1}`},
+		{"```json\n{\"raw_memory\":\"Keep ``` code samples\",\"rollout_summary\":\"test\"}\n```", "{\"raw_memory\":\"Keep ``` code samples\",\"rollout_summary\":\"test\"}"},
+		{"```json\n{\"a\":}\n```", "```json\n{\"a\":}\n```"},
+		{"```json\n{\"a\":1", "```json\n{\"a\":1"},
+		{"```python\n{}\n```", "```python\n{}\n```"},
+		{"```json\n{} {}\n```", "```json\n{} {}\n```"},
 		// not a fence around the whole answer: left as it came
 		{`{"a":"` + "```" + `"}`, `{"a":"` + "```" + `"}`},
 		{"Here it is:\n```json\n{}\n```", "Here it is:\n```json\n{}\n```"},
@@ -117,5 +120,84 @@ func TestUnfence(t *testing.T) {
 		if got, _ := unfence(c.in); got != c.want {
 			t.Errorf("unfence(%q) = %q, want %q", c.in, got, c.want)
 		}
+	}
+}
+
+// Moving the schema into instructions must not lose the client's JSON
+// requirement, and buffering its text must preserve reasoning, usage and IDs.
+func TestStructuredOutputFenceAfterSystemFallback(t *testing.T) {
+	const memory = "{\"raw_memory\":\"Keep ``` examples\",\"rollout_summary\":\"test\"}"
+	for _, stream := range []bool{false, true} {
+		t.Run(map[bool]string{false: "whole", true: "streamed"}[stream], func(t *testing.T) {
+			req := (&Request{Model: "m", Stream: stream, Format: &Format{Type: "json_object"}}).inSystem()
+			input := []Event{
+				{Kind: KStart, MsgID: "resp_fence"},
+				{Kind: KThink, Text: "reasoning"},
+				{Kind: KText, Text: "``"},
+				{Kind: KText, Text: "`json\n" + memory},
+				{Kind: KUsage, Usage: Usage{Input: 5, Output: 8}},
+				{Kind: KText, Text: "\n```"},
+				{Kind: KStop, Stop: "stop"},
+			}
+			ch := make(chan Event, len(input))
+			for _, ev := range input {
+				ch <- ev
+			}
+			close(ch)
+			rec := httptest.NewRecorder()
+			var u Usage
+			code, failed := relayStatus(rec, provider.Responses, "fixture", req, ch, &u, func() {})
+			if code != 200 || failed != "" {
+				t.Fatalf("status %d: %s", code, failed)
+			}
+			out := rec.Body.String()
+			if got := responsesText(t, out, stream); got != memory {
+				t.Fatalf("text = %q, want %q", got, memory)
+			}
+			res, err := compactReply([]byte(out))
+			if err != nil || messageText(res) != memory || res.Status != "completed" {
+				t.Fatalf("final reply: %+v, error %v", res, err)
+			}
+			if !strings.Contains(out, "reasoning") || u.ResponseID != "resp_fence" || u.Input != 5 || u.Output != 8 {
+				t.Fatalf("metadata lost: usage %+v, reply %s", u, out)
+			}
+		})
+	}
+}
+
+func TestStructuredOutputFencePreservesIncompleteReplies(t *testing.T) {
+	const partial = "```json\n{\"raw_memory\":"
+	for _, failed := range []bool{false, true} {
+		t.Run(map[bool]string{false: "length", true: "error"}[failed], func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			enc := encoder(provider.Responses, newSSEWriter(rec), &Request{Model: "m", Format: &Format{Type: "json_object"}})
+			enc.event(Event{Kind: KText, Text: partial})
+			if failed {
+				enc.event(Event{Kind: KError, Text: "upstream interrupted", Code: "server_error"})
+			} else {
+				enc.event(Event{Kind: KStop, Stop: "length"})
+				enc.finish()
+			}
+			out := rec.Body.String()
+			if got := responsesText(t, out, true); got != partial {
+				t.Fatalf("partial text = %q, want %q", got, partial)
+			}
+			want := "response.incomplete"
+			if failed {
+				want = "response.failed"
+			}
+			if !strings.Contains(out, want) || strings.Contains(out, "response.completed") {
+				t.Fatalf("wrong completion: %s", out)
+			}
+		})
+	}
+}
+
+func TestStructuredOutputUnfencedTextStreamsImmediately(t *testing.T) {
+	rec := httptest.NewRecorder()
+	enc := encoder(provider.Responses, newSSEWriter(rec), &Request{Model: "m", Format: &Format{Type: "json_object"}})
+	enc.event(Event{Kind: KText, Text: `{"raw_memory":`})
+	if got := responsesText(t, rec.Body.String(), true); got != `{"raw_memory":` {
+		t.Fatalf("initial delta buffered: %q", got)
 	}
 }

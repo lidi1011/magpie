@@ -1,19 +1,13 @@
 package gateway
 
-import "strings"
-
-// A model asked for JSON through a translated format (a Gemini model's
-// responseJsonSchema, a Chat relay's response_format, a format told in the
-// system prompt) may still wrap its answer in a Markdown code fence:
-// ```json\n{…}\n```. A client that asked for structured output parses the
-// text as JSON as it is, so the fenced answer fails it: Codex's memory
-// extraction on such a model failed every time with "expected value at
-// line 1 column 1". fenceEncoder and unfencedResult hand the client the JSON
-// inside the fence; any other answer passes as it came.
+import (
+	"encoding/json"
+	"strings"
+)
 
 // unfence is said with a code fence around the whole of it taken off, and
-// whether there was one: an opening ``` (with or without a language tag)
-// on the first line and a closing ``` that ends the text.
+// whether there was one. Only a whole JSON value inside an unlabelled or
+// json-labelled fence is unwrapped; invalid and truncated answers stay intact.
 func unfence(said string) (string, bool) {
 	t := strings.TrimSpace(said)
 	if len(t) < 6 || !strings.HasPrefix(t, "```") || !strings.HasSuffix(t, "```") {
@@ -23,11 +17,11 @@ func unfence(said string) (string, bool) {
 	if nl < 0 {
 		return said, false
 	}
-	if tag := strings.TrimSpace(t[3:nl]); strings.ContainsAny(tag, " {[\"`") {
+	if tag := strings.TrimSpace(t[3:nl]); tag != "" && !strings.EqualFold(tag, "json") {
 		return said, false
 	}
 	inner := strings.TrimSpace(t[nl+1 : len(t)-3])
-	if inner == "" || strings.Contains(inner, "```") {
+	if !json.Valid([]byte(inner)) {
 		return said, false
 	}
 	return inner, true
