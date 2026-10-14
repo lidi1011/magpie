@@ -125,7 +125,7 @@ func (r *Request) inSystem() *Request {
 		return r
 	}
 	q := *r
-	q.Format = nil
+	q.Format, q.FormatTold = nil, true
 	if q.System != "" {
 		q.System += "\n\n"
 	}
@@ -148,3 +148,7 @@ var formatRefusal = regexp.MustCompile(`(?i)response_format|json_schema|json_obj
 func refusesFormat(status int, body []byte) bool {
 	return (status == 400 || status == 422) && formatRefusal.Match(body)
 }
+
+// wantsJSON is whether the client asked for structured output, in a field
+// or told in the system prompt.
+func (r *Request) wantsJSON() bool { return r.Format != nil || r.FormatTold }
